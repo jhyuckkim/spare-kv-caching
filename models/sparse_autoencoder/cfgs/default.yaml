@@ -1,0 +1,15 @@
+seed: 49
+num_epochs: 10
+head_dim: 128
+dictionary_size: 4096
+sparsity: 32
+num_layers: 32
+num_heads: 8
+batch_size: 4096
+lm_batch_size: 64
+dataset_size: 1801350
+buffer_mult: 384
+lr: 1e-4
+beta1: 0.9
+beta2: 0.99
+device: "cuda:0"
