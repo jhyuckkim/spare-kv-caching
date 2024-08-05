@@ -8,7 +8,7 @@ from model import *
 
 def main():
     # Load config
-    config_path = "cfgs/test.yaml"
+    config_path = "cfgs/default.yaml"
     cfg = load_yaml_cfg(config_path)
     cfg = arg_parse_update_cfg(cfg)
     post_init_cfg(cfg)

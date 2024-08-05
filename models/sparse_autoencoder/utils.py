@@ -85,11 +85,11 @@ class Buffer():
             buffer_slice_size = min(self.buffer.shape[0] - self.pointer, kvs.size(0))
             self.buffer[self.pointer:self.pointer + buffer_slice_size, :, :] = kvs[:buffer_slice_size]
             self.pointer += buffer_slice_size
-            print(kvs.size(0))
-            print(self.pointer, self.buffer.shape[0])
             self.text_pointer += self.cfg["lm_batch_size"]
             if self.text_pointer > len(self.all_texts) - self.cfg["lm_batch_size"]:
                 self.text_pointer = 0
+                
+            torch.cuda.empty_cache()
 
         self.pointer = 0
         self.buffer = self.buffer[torch.randperm(self.buffer.shape[0]).to(self.cfg["device"])]
