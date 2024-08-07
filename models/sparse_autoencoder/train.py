@@ -8,7 +8,7 @@ from model import *
 
 def main():
     # Load config
-    config_path = "cfgs/default.yaml"
+    config_path = "cfgs/d_size_8192.yaml"
     cfg = load_yaml_cfg(config_path)
     cfg = arg_parse_update_cfg(cfg)
     post_init_cfg(cfg)
@@ -29,6 +29,7 @@ def main():
 
     # Initialize Buffer
     buffer = Buffer(cfg)
+    eval_buffer = Buffer(cfg, "test")
 
     batches_per_epoch = cfg["dataset_size"] // cfg["batch_size"]
     encoder_optim = torch.optim.Adam(autoencoder.parameters(), lr=cfg["lr"], betas=(cfg["beta1"], cfg["beta2"]))
@@ -57,6 +58,25 @@ def main():
         # Save a checkpoint at the end of each epoch
         autoencoder.save(is_checkpoint=True)
         print(f"Checkpoint saved at the end of epoch {epoch + 1}")
+    
+        # Periodically evaluate the model
+        if (epoch + 1) % cfg["eval_interval"] == 0:
+            autoencoder.eval()
+            batches = 0
+
+            with torch.no_grad():
+                kvs = eval_buffer.next()
+                loss, k_hat, y = autoencoder(kvs)
+
+                reconstruction_error = torch.norm(kvs - k_hat, dim=-1)
+                original_norm = torch.norm(kvs, dim=-1)
+                relative_reconstruction_error = torch.mean(reconstruction_error / (original_norm + 1e-8)).item()
+
+            print(f"Evaluation - Epoch {epoch + 1}: Average Loss: {loss}, Average Relative Reconstruction Error: {relative_reconstruction_error}, Total KV Vectors: {total_vectors}")
+            writer.add_scalar('Loss/eval', loss, epoch + 1)
+            writer.add_scalar('RelativeReconstructionError/eval', relative_reconstruction_error, epoch + 1)
+
+            autoencoder.train()
     
     # Save the final model state
     autoencoder.save(is_checkpoint=False)

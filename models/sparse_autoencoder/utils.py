@@ -31,13 +31,13 @@ class Buffer():
     """
     This buffer stores a bunch of KV vectors that can be used to train the autoencoder.
     """
-    def __init__(self, cfg):
+    def __init__(self, cfg, split="train"):
         self.cfg = cfg
         self.buffer = torch.zeros((cfg["buffer_size"], cfg["num_layers"] * 2, cfg["head_dim"]), requires_grad=False).to(cfg["device"])
         self.text_pointer = 0
         self.first = True
 
-        self.all_texts = load_dataset("Salesforce/wikitext", "wikitext-103-v1")["train"]["text"]
+        self.all_texts = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1")[split]["text"]
         random.shuffle(self.all_texts)
 
         login("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")

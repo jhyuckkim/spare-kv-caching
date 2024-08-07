@@ -1,7 +1,8 @@
 seed: 0
 num_epochs: 10
+eval_interval: 1
 head_dim: 128
-dictionary_size: 4096
+dictionary_size: 8192
 sparsity: 32
 num_layers: 32
 num_heads: 8
