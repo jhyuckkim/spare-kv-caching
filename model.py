@@ -15,6 +15,7 @@ from transformers import BitsAndBytesConfig, AutoTokenizer, AutoModelForCausalLM
 # import lm_eval
 
 from utils import *
+from omp import run_omp
 
 # FOR MONITORING
 from torch.utils.tensorboard import SummaryWriter
@@ -81,77 +82,80 @@ class SparseKVLanguageModel(nn.Module):
         assert num_layers_times_2 == self.num_layers * 2 and num_heads == self.num_heads and head_dim == self.head_dim, \
             "Input dimensions do not match model configuration"
 
-        omp = OrthogonalMatchingPursuit(n_nonzero_coefs=sparsity)
-
         def get_relative_reconstruction_error(k, k_hat):
-            return torch.norm(k - k_hat) / torch.norm(k)
-
-        def single_pair_omp(k, D):
-            """
-            :param k: (head_dim)
-            :param D: (dictionary_size, head_dim)
-            """
-            k = k.numpy()
-            D = D.numpy()
-            with warnings.catch_warnings():
-                warnings.filterwarnings('ignore', category=RuntimeWarning, message='Orthogonal matching pursuit ended prematurely due to linear dependence in the dictionary. The requested precision might not have been met.')
-                omp.fit(D.T, k)
-            y = omp.coef_
-            k_hat = omp.predict(D.T)
-            error = get_relative_reconstruction_error(torch.tensor(k), torch.tensor(k_hat))
-            return y, torch.tensor(k_hat, dtype=torch.float16), error
+            return torch.norm(k - k_hat, dim=-1) / torch.norm(k, dim=-1)
         
-        def convert_to_sparse_format(y_list):
+        def convert_to_sparse_format(y_tensor):
+            # Find non-zero elements
+            non_zero_mask = y_tensor != 0
+            
+            # Get the indices of non-zero elements
+            batch_indices, element_indices = non_zero_mask.nonzero(as_tuple=True)
+            
+            # Get the values of non-zero elements
+            non_zero_values = y_tensor[non_zero_mask]
+            
+            # Split the indices and values into lists of tensors for each batch
             sparse_y_list = []
-            for y in y_list:
-                non_zero_indices = torch.tensor(np.nonzero(y)[0], dtype=torch.int)
-                non_zero_values = torch.tensor(y[non_zero_indices], dtype=torch.float16)
-                sparse_y_list.append((non_zero_indices.to(self.device), non_zero_values.to(self.device)))
+            for batch_idx in range(y_tensor.size(0)):
+                batch_mask = batch_indices == batch_idx
+                non_zero_indices = element_indices[batch_mask]
+                values = non_zero_values[batch_mask]
+                sparse_y_list.append((non_zero_indices.to(self.device), values.to(self.device)))
             
             return sparse_y_list
         
-        # duplicate dictionaries by num_heads
-        kvs_flattened = kvs.view(-1, head_dim)
-        dictionaries_flattened = [D.cpu() for D_single_batch in dictionaries for D in D_single_batch]
+        kvs_flattened = kvs.view(-1, num_heads, head_dim)
+        dictionaries_flattened = [D for D_single_batch in dictionaries for D in D_single_batch]
 
-        results = Parallel(n_jobs=-1)(delayed(single_pair_omp)(k, dictionaries_flattened[i // num_heads]) for i, k in enumerate(kvs_flattened))
-
-        y_list, kv_hat_list, errors = map(list, zip(*results))
+        ys_list = []
+        kv_hat_list = []
+        errors = []
 
         num_errors_above_threshold = 0
 
-        for i, error in enumerate(errors):
-            if error > error_threshold:
-                # DEBUGGING LINE
-                num_errors_above_threshold += 1
+        for i, (k, D) in enumerate(zip(kvs_flattened, dictionaries_flattened)):
+            y = run_omp(D.T, k, sparsity, precompute=True, tol=0.0, normalize=False, fit_intercept=False, alg='v0')
+            k_hat = y @ D
+            error = get_relative_reconstruction_error(k, k_hat)
+            sparse_y = convert_to_sparse_format(y)
 
-                # normalise k_hat and add to dictionary
-                kv_hat_list[i] = kvs_flattened[i]
-                k_hat_norm = torch.norm(kv_hat_list[i])
-                k_normalised = kv_hat_list[i] / k_hat_norm
-                batch_idx = i // (num_layers_times_2 * num_heads)
-                layer_idx = (i // num_heads) % num_layers_times_2
-                dictionaries[batch_idx][layer_idx] = torch.cat((dictionaries[batch_idx][layer_idx], k_normalised.unsqueeze(0).to(self.device)), dim=0)
-                y = np.zeros(dictionaries[batch_idx][layer_idx].shape[0])
-                y[-1] = k_hat_norm.item()
-                y_list[i] = y
-        
-        sparse_y_list = convert_to_sparse_format(y_list)
-        ys = [[[sparse_y_list[b * num_layers_times_2 * num_heads + l * num_heads + h]
-                    for h in range(num_heads)
-                ]
-                for l in range(num_layers_times_2)
-            ]
-            for b in range(batch_size)
-        ]
-        # kvs_hat = torch.stack(kv_hat_list).view(batch_size, num_layers_times_2, num_heads, head_dim)
-        errors = np.array(errors).reshape(batch_size, num_layers_times_2, num_heads)
+            # error thresholding here
+            indices = torch.nonzero(error > error_threshold).squeeze()
+            n_high_error = len(indices)
+
+            if n_high_error > 0:
+
+                # DEBUGGING LINE
+                num_errors_above_threshold += n_high_error
+
+                k_high_error = k[indices]
+                k_hat[indices] = k_high_error
+                k_high_error_norm = torch.norm(k_high_error, dim=-1, keepdim=True)
+                k_high_error_normalised = k_high_error / k_high_error_norm
+
+                batch_idx, layer_idx = divmod(i, num_layers_times_2)
+                d_size = len(dictionaries[batch_idx][layer_idx])
+                dictionaries[batch_idx][layer_idx] = torch.cat((dictionaries[batch_idx][layer_idx], k_high_error_normalised), dim=0)
+
+                # update sparse_y
+                for i in range(n_high_error):
+                    idx = indices[i].item()
+                    sparse_y[idx] = (torch.tensor([d_size + i]).to(self.device), k_high_error_norm[i])
+
+            ys_list.append(sparse_y)
+            kv_hat_list.append(k_hat)
+            errors.append(error)
+
+        # reshape ys_list from list of list with shape (batch_size*num_layers_times_2, num_heads) to list of list of list with shape (batch_size, num_layers_times_2, num_heads)
+        ys_list = [ys_list[i*num_layers_times_2:(i+1)*num_layers_times_2] for i in range(batch_size)]
+        errors = torch.cat(errors)
 
         # DEBUGGING LINES
-        avg_error = np.mean(errors)
-        proportion_above_threshold = num_errors_above_threshold / len(errors.flatten())
+        avg_error = torch.mean(errors).item()
+        proportion_above_threshold = num_errors_above_threshold / len(errors)
 
-        return ys, errors, avg_error, proportion_above_threshold
+        return ys_list, errors, avg_error, proportion_above_threshold
     
     def from_context_KV_to_initial_dictionary(self, past_key_values):
         batch_size, num_heads, seq_len, head_dim = past_key_values[0][0].shape
@@ -243,9 +247,9 @@ class SparseKVLanguageModel(nn.Module):
         new_values = torch.stack([kv[1][:, :, -1, :] for kv in past_key_values], dim=1)  # shape: (batch_size, num_layers, num_heads, head_dim)
 
         # Interleave keys and values
-        new_kvs = torch.zeros(batch_size, num_layers * 2, num_heads, head_dim, dtype=new_keys.dtype)
-        new_kvs[:, 0::2, :, :] = new_keys.cpu()
-        new_kvs[:, 1::2, :, :] = new_values.cpu()
+        new_kvs = torch.zeros(batch_size, num_layers * 2, num_heads, head_dim, dtype=new_keys.dtype, device=self.device)
+        new_kvs[:, 0::2, :, :] = new_keys
+        new_kvs[:, 1::2, :, :] = new_values
 
         return new_kvs
     
