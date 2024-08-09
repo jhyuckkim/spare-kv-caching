@@ -2,8 +2,7 @@ import warnings
 from enum import Enum
 
 import numpy as np
-from joblib import Parallel, delayed
-from sklearn.linear_model import OrthogonalMatchingPursuit
+import cupy as cp
 
 import torch
 import torch.nn as nn
@@ -40,7 +39,7 @@ class SparseKVLanguageModel(nn.Module):
 
         if self.caching_method == CachingMethod.ADAPTIVE_LEARNING:
             self.error_threshold = cfg["error_threshold"]
-            self.spartsity = cfg["sparsity"]
+            self.sparsity = cfg["sparsity"]
 
         login("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")
         compute_dtype = getattr(torch, "float16")
@@ -118,10 +117,12 @@ class SparseKVLanguageModel(nn.Module):
             y = run_omp(D.T, k, sparsity, precompute=True, tol=0.0, normalize=False, fit_intercept=False, alg='v0')
             k_hat = y @ D
             error = get_relative_reconstruction_error(k, k_hat)
+            if torch.isnan(error).any():
+                error[torch.isnan(error)] = float('inf')
             sparse_y = convert_to_sparse_format(y)
 
             # error thresholding here
-            indices = torch.nonzero(error > error_threshold).squeeze()
+            indices = torch.nonzero(error > error_threshold).view(-1)
             n_high_error = len(indices)
 
             if n_high_error > 0:
@@ -191,6 +192,7 @@ class SparseKVLanguageModel(nn.Module):
         
         return D_batch_list, past_ys
 
+    # TODO: This is taking the most time, prarallelise the loop
     def from_sparse_representation_to_KV(self, ys, dictionaries):
         """
         :param ys: list of list of list of list of shape (seq_len, batch_size, num_layer*2, num_heads)
@@ -204,31 +206,42 @@ class SparseKVLanguageModel(nn.Module):
         seq_len = len(ys)
         num_heads = len(ys[0][0][0])
 
-        def process_layer(seq_idx, batch_idx, l, h, y, D, num_layers_times_2, head_dim):
-            indices, values = y
-            k = torch.matmul(values.unsqueeze(0), D[indices]).squeeze(0)
-            layer_idx = l // 2
-            return (seq_idx, batch_idx, layer_idx, l, h, k)
+        past_key_values = [(torch.zeros(batch_size, num_heads, seq_len, head_dim, dtype=torch.float16, device=self.device), 
+                    torch.zeros(batch_size, num_heads, seq_len, head_dim, dtype=torch.float16, device=self.device)) for _ in range(num_layers_times_2 // 2)]
 
-        past_key_values = [(torch.zeros(batch_size, num_heads, seq_len, head_dim, dtype=torch.float16), 
-                    torch.zeros(batch_size, num_heads, seq_len, head_dim, dtype=torch.float16)) for _ in range(num_layers_times_2 // 2)]
+        # iterate through dictionaries
+        for batch_idx, batch_dictionaries in enumerate(dictionaries):
+            for l, D in enumerate(batch_dictionaries):
+                # select sparse representations to reconstruct
+                sparse_representations = [ys[token_idx][batch_idx][l][h] for token_idx in range(seq_len) for h in range(num_heads)]
 
-        def gen_parallel_tasks():
-            for seq_idx, single_token_ys in enumerate(ys):
-                for batch_idx, single_batch_ys in enumerate(single_token_ys):
-                    for l, single_layer_ys in enumerate(single_batch_ys):
-                        for h, y in enumerate(single_layer_ys):
-                            yield delayed(process_layer)(seq_idx, batch_idx, l, h, y, dictionaries[batch_idx][l], num_layers_times_2, head_dim)
+                # Initialize row indices, col indices and values for the sparse matrix
+                row_indices = []
+                col_indices = []
+                values = []
 
-        results = Parallel(n_jobs=-1)(gen_parallel_tasks())
+                for i, (indices, vals) in enumerate(sparse_representations):
+                    row_indices.append(cp.asarray([i] * len(indices)))
+                    col_indices.extend(cp.asarray(indices))
+                    values.extend(cp.asarray(vals))
 
-        for seq_idx, batch_idx, layer_idx, l, h, k in results:
-            if l % 2 == 0:
-                past_key_values[layer_idx][0][batch_idx, h, seq_idx] = k
-            else:
-                past_key_values[layer_idx][1][batch_idx, h, seq_idx] = k
+                # Convert lists to 1-D CuPy arrays
+                row_indices = cp.concatenate(row_indices)
+                col_indices = cp.asarray(col_indices)
+                values = cp.asarray(values, dtype=cp.float32)
+
+                # Create the sparse matrix with shape (batch_size, n)
+                sparse_matrix = cp.sparse.coo_matrix((values, (row_indices, col_indices)), shape=(len(sparse_representations), D.size(0)))
+
+                k_hat = sparse_matrix.dot(cp.asarray(D)) # k_hat is cupy of shape (seq_len * num_heads, head_dim) at batch_idx and l
+
+                if l % 2 == 0:
+                    past_key_values[l // 2][0][batch_idx] = torch.as_tensor(k_hat, dtype=torch.float16, device=self.device).view(seq_len, num_heads, head_dim).permute(1, 0, 2)
+                else:
+                    past_key_values[l // 2][1][batch_idx] = torch.as_tensor(k_hat, dtype=torch.float16, device=self.device).view(seq_len, num_heads, head_dim).permute(1, 0, 2)
 
         return tuple(past_key_values)
+
     
     def extract_new_KV_from_past_key_values(self, past_key_values):
         """
@@ -255,6 +268,7 @@ class SparseKVLanguageModel(nn.Module):
     
     @torch.no_grad()
     def generate_autoregressively(self, context, temperature, is_greedy, max_token_length, stop_tokens, measure_memory=False):
+        import time
         context_len = len(context[0])
         if measure_memory:
             full_kv_memory_measurements = []
@@ -263,13 +277,17 @@ class SparseKVLanguageModel(nn.Module):
         writer = SummaryWriter('runs/sequence_generation')
 
         # initial forward pass
+        start_time = time.time()
         outputs = self.model(context, use_cache=True)
+        print(f"Initial forward pass: {time.time() - start_time:.2f} seconds")
 
         if measure_memory:
             full_kv_memory_measurements.append(memory_past_key_values(outputs.past_key_values))
 
         if self.caching_method == CachingMethod.ADAPTIVE_LEARNING:
+            start_time = time.time()
             dictionaries, past_ys = self.from_context_KV_to_initial_dictionary(outputs.past_key_values)
+            print(f"from_context_KV_to_initial_dictionary: {time.time() - start_time:.2f} seconds")
             del outputs.past_key_values
             if measure_memory:
                 adaptive_learning_memory_measurements = {'dictionaries': [], 'past_ys': []}
@@ -296,22 +314,33 @@ class SparseKVLanguageModel(nn.Module):
             
             if self.caching_method == CachingMethod.ADAPTIVE_LEARNING:
                 # go from sparse y_past to ready to inject past_key_values
+                start_time = time.time()
                 past_key_values = self.from_sparse_representation_to_KV(past_ys, dictionaries)
+                print(f"from_sparse_representation_to_KV: {time.time() - start_time:.2f} seconds")
             elif self.caching_method == CachingMethod.FULL_KV_CACHE:
+                start_time = time.time()
                 past_key_values = outputs(outputs.past_key_values)
+                print(f"FULL_KV_CACHE: {time.time() - start_time:.2f} seconds")
+
             # model forward with reconstructed past_key_values
+            start_time = time.time()
             outputs = self.model(next_token, past_key_values=past_key_values)
+            print(f"Model forward pass: {time.time() - start_time:.2f} seconds")
 
             if measure_memory:
                 full_kv_memory_measurements.append(memory_past_key_values(outputs.past_key_values))
 
             if self.caching_method == CachingMethod.ADAPTIVE_LEARNING:
                 # function to extract new kvs
+                start_time = time.time()
                 new_kvs = self.extract_new_KV_from_past_key_values(outputs.past_key_values)
+                print(f"extract_new_KV_from_past_key_values: {time.time() - start_time:.2f} seconds")
                 del outputs.past_key_values
 
                 # get_sparse_representations_omp
-                new_ys, errors, avg_error, proportion_above_threshold = self.get_sparse_representations_omp(new_kvs, dictionaries, self.spartsity, self.error_threshold)
+                start_time = time.time()
+                new_ys, errors, avg_error, proportion_above_threshold = self.get_sparse_representations_omp(new_kvs, dictionaries, self.sparsity, self.error_threshold)
+                print(f"get_sparse_representations_omp: {time.time() - start_time:.2f} seconds")
 
                 # update y_past
                 past_ys.append(new_ys)
