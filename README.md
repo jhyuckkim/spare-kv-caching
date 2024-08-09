@@ -1,1 +1,1 @@
-# spare-kv-caching
+# sparse-kv-caching
